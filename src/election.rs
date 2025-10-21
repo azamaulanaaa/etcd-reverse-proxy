@@ -29,7 +29,7 @@ impl Election {
 
     pub async fn run(&self) -> anyhow::Result<()> {
         loop {
-            log::debug!("Request for least id");
+            log::debug!("Request for lease id");
             let lease_id = match self.create_lease().await {
                 Ok(id) => id,
                 Err(e) => {
