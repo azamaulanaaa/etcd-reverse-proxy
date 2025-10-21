@@ -27,7 +27,7 @@ impl Election {
         }
     }
 
-    pub async fn run(&mut self) -> anyhow::Result<()> {
+    pub async fn run(&self) -> anyhow::Result<()> {
         loop {
             log::debug!("Request for least id");
             let lease_id = match self.create_lease().await {
@@ -61,7 +61,7 @@ impl Election {
         }
     }
 
-    async fn create_lease(&mut self) -> anyhow::Result<i64> {
+    async fn create_lease(&self) -> anyhow::Result<i64> {
         let resp = self
             .client
             .lease_client()
@@ -71,7 +71,7 @@ impl Election {
         Ok(resp.id())
     }
 
-    async fn try_campaign(&mut self, lease_id: i64) -> anyhow::Result<bool> {
+    async fn try_campaign(&self, lease_id: i64) -> anyhow::Result<bool> {
         let compare = Compare::version(self.config.leader_key.clone(), CompareOp::Equal, 0);
 
         let put_options = PutOptions::new().with_lease(lease_id);
@@ -98,7 +98,7 @@ impl Election {
         Ok(resp.succeeded())
     }
 
-    async fn maintain_leadership(&mut self, lease_id: i64) -> anyhow::Result<()> {
+    async fn maintain_leadership(&self, lease_id: i64) -> anyhow::Result<()> {
         let keepalive_timeout = Duration::from_secs(self.config.ttl_second as u64 / 2);
         let mut lease_client = self.client.lease_client();
 
@@ -139,7 +139,7 @@ impl Election {
         }
     }
 
-    pub async fn watch(&mut self) -> anyhow::Result<WatchStream> {
+    pub async fn watch(&self) -> anyhow::Result<WatchStream> {
         let mut watcher_client = self.client.watch_client().clone();
 
         log::debug!("Watching leader value changes");
