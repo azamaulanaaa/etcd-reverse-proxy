@@ -14,25 +14,23 @@ pub struct ElectionConfig {
 
 pub struct Election {
     instance_id: String,
-    client: Client,
     config: ElectionConfig,
     retry_delay: Duration,
 }
 
 impl Election {
-    pub fn new(instance_id: String, client: Client, config: ElectionConfig) -> Self {
+    pub fn new(instance_id: String, config: ElectionConfig) -> Self {
         Self {
             instance_id,
-            client,
             config,
             retry_delay: Duration::from_millis(rand::random_range(1..=5 * 1000)),
         }
     }
 
-    pub async fn run(&self) -> anyhow::Result<()> {
+    pub async fn run(&self, etcd_client: Client) -> anyhow::Result<()> {
         loop {
             log::debug!("Request for lease id");
-            let lease_id = match self.create_lease().await {
+            let lease_id = match self.create_lease(etcd_client.clone()).await {
                 Ok(id) => id,
                 Err(e) => {
                     log::error!("Failed to create lease: {:?}", e);
@@ -43,10 +41,13 @@ impl Election {
             log::debug!("Granted lease id: {:?}", lease_id);
 
             log::debug!("Start campaign");
-            match self.try_campaign(lease_id).await {
+            match self.try_campaign(lease_id, etcd_client.clone()).await {
                 Ok(true) => {
                     log::info!("Status: client is a leader");
-                    if let Err(e) = self.maintain_leadership(lease_id).await {
+                    if let Err(e) = self
+                        .maintain_leadership(lease_id, etcd_client.clone())
+                        .await
+                    {
                         log::warn!("Leader maintenance failed: {:?}", e);
                     }
                 }
@@ -58,7 +59,7 @@ impl Election {
                 }
             }
 
-            let _ = self.client.lease_client().revoke(lease_id).await;
+            let _ = etcd_client.lease_client().revoke(lease_id).await;
             sleep(
                 self.retry_delay
                     .add(Duration::from_secs(self.config.ttl_second.into())),
@@ -67,9 +68,8 @@ impl Election {
         }
     }
 
-    async fn create_lease(&self) -> anyhow::Result<i64> {
-        let resp = self
-            .client
+    async fn create_lease(&self, etcd_client: Client) -> anyhow::Result<i64> {
+        let resp = etcd_client
             .lease_client()
             .grant(self.config.ttl_second as i64, None)
             .await
@@ -77,7 +77,7 @@ impl Election {
         Ok(resp.id())
     }
 
-    async fn try_campaign(&self, lease_id: i64) -> anyhow::Result<bool> {
+    async fn try_campaign(&self, lease_id: i64, etcd_client: Client) -> anyhow::Result<bool> {
         let compare = Compare::version(self.config.leader_key.clone(), CompareOp::Equal, 0);
 
         let put_options = PutOptions::new().with_lease(lease_id);
@@ -94,8 +94,7 @@ impl Election {
             .and_then(vec![put_op])
             .or_else(vec![get_op]);
 
-        let resp = self
-            .client
+        let resp = etcd_client
             .kv_client()
             .txn(txn)
             .await
@@ -104,9 +103,9 @@ impl Election {
         Ok(resp.succeeded())
     }
 
-    async fn maintain_leadership(&self, lease_id: i64) -> anyhow::Result<()> {
+    async fn maintain_leadership(&self, lease_id: i64, etcd_client: Client) -> anyhow::Result<()> {
         let keepalive_timeout = Duration::from_secs(self.config.ttl_second as u64 / 2);
-        let mut lease_client = self.client.lease_client();
+        let mut lease_client = etcd_client.lease_client();
 
         log::debug!("Start KeepAlive");
         let (mut keeper, mut response_stream) = lease_client
@@ -145,8 +144,8 @@ impl Election {
         }
     }
 
-    pub async fn watch(&self) -> anyhow::Result<WatchStream> {
-        let mut watcher_client = self.client.watch_client().clone();
+    pub async fn watch(&self, etcd_client: Client) -> anyhow::Result<WatchStream> {
+        let mut watcher_client = etcd_client.watch_client().clone();
 
         log::debug!("Watching leader value changes");
         let (_, stream) = watcher_client
@@ -157,8 +156,8 @@ impl Election {
         return Ok(stream);
     }
 
-    pub async fn leader_id(&self) -> anyhow::Result<Option<String>> {
-        let mut kv_client = self.client.kv_client().clone();
+    pub async fn leader_id(&self, etcd_client: Client) -> anyhow::Result<Option<String>> {
+        let mut kv_client = etcd_client.kv_client().clone();
 
         let resp = kv_client
             .get(self.config.leader_key.clone(), None)
