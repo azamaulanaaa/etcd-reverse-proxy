@@ -13,6 +13,7 @@ pub struct Election {
     instance_id: String,
     client: Client,
     config: ElectionConfig,
+    retry_delay: Duration,
 }
 
 impl Election {
@@ -21,6 +22,7 @@ impl Election {
             instance_id,
             client,
             config,
+            retry_delay: Duration::from_millis(rand::random_range(60..=60 * 1000)),
         }
     }
 
@@ -54,7 +56,7 @@ impl Election {
             }
 
             let _ = self.client.lease_client().revoke(lease_id).await;
-            sleep(Duration::from_secs(1)).await;
+            sleep(self.retry_delay).await;
         }
     }
 
