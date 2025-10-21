@@ -156,4 +156,21 @@ impl Election {
 
         return Ok(stream);
     }
+
+    pub async fn leader_id(&self) -> anyhow::Result<Option<String>> {
+        let mut kv_client = self.client.kv_client().clone();
+
+        let resp = kv_client
+            .get(self.config.leader_key.clone(), None)
+            .await
+            .context("Failed to get leader id")?;
+        let value = resp
+            .kvs()
+            .get(0)
+            .map(|kv| kv.value_str())
+            .transpose()?
+            .map(|s| s.to_owned());
+
+        Ok(value)
+    }
 }
