@@ -11,6 +11,8 @@ etcd-client = "0.17.0"
 log = "0.4.28"
 pingora = "0.6.0"
 rand = "0.9.2"
+serde = { version = "1.0", features = ["derive"] }
 simple_logger = "5.1"
 thiserror = "2.0"
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+toml = "0.9"
