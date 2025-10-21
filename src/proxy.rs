@@ -108,6 +108,19 @@ where
     }
 }
 
+impl<P> Clone for TcpProxyApp<P>
+where
+    P: Peer + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        TcpProxyApp {
+            upstream_state: self.upstream_state.clone(),
+            client_connector: TransportConnector::new(None),
+            buf_size: self.buf_size,
+        }
+    }
+}
+
 pub struct PeerState<P>
 where
     P: Peer + Send + Sync,
