@@ -41,7 +41,7 @@ impl Election {
             match self.try_campaign(lease_id).await {
                 Ok(true) => {
                     log::info!("Status: client is a leader");
-                    if let Err(e) = self.maintin_leadership(lease_id).await {
+                    if let Err(e) = self.maintain_leadership(lease_id).await {
                         log::warn!("Leader maintenance failed: {:?}", e);
                     }
                 }
@@ -95,7 +95,7 @@ impl Election {
         Ok(resp.succeeded())
     }
 
-    async fn maintin_leadership(&mut self, lease_id: i64) -> anyhow::Result<()> {
+    async fn maintain_leadership(&mut self, lease_id: i64) -> anyhow::Result<()> {
         let keepalive_timeout = Duration::from_secs(self.config.ttl_second as u64 / 2);
         let mut lease_client = self.client.lease_client();
 
