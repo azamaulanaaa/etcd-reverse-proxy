@@ -7,9 +7,7 @@ use anyhow::Context;
 use clap::Parser;
 use election::{Election, ElectionConfig, EventType};
 use etcd_client::{Client, WatchStream};
-use pingora::{
-    listeners::Listeners, server::Server, services::listening::Service, upstreams::peer::BasicPeer,
-};
+use pingora::{listeners::Listeners, server::Server, services::listening::Service};
 use proxy::TcpProxyApp;
 use simple_logger::SimpleLogger;
 
@@ -32,13 +30,13 @@ async fn main() -> anyhow::Result<()> {
     SimpleLogger::new().with_level(log_level).init()?;
 
     app(Config {
-        advertise_host: String::from("0.0.0.0"),
-        advertise_port: 8080,
+        proxy_name: String::from("etcd"),
+        advertise_addr: String::from("0.0.0.0:8080"),
+        upstream_addr: String::from("node-01-etcd:2379"),
+
         leader_key: String::from("etcd-reverse-proxy/leader"),
-        etcd_addr: vec![String::from("node-01-etcd:2379")],
-        upstream_host: String::from("216.239.38.120"),
-        upstream_port: 443,
-        stream_buf_size: 8 * 1024,
+        etcd_addr: String::from("node-01-etcd:2379"),
+        buf_size: 8 * 1024,
     })
     .await?;
 
@@ -46,26 +44,21 @@ async fn main() -> anyhow::Result<()> {
 }
 
 struct Config {
-    advertise_host: String,
-    advertise_port: u16,
+    proxy_name: String,
+    advertise_addr: String,
+    upstream_addr: String,
+    buf_size: usize,
+
     leader_key: String,
-    etcd_addr: Vec<String>,
-    upstream_host: String,
-    upstream_port: u16,
-    stream_buf_size: usize,
+    etcd_addr: String,
 }
 
 async fn app(config: Config) -> anyhow::Result<()> {
-    let upstream_addr = format!("{}:{}", config.upstream_host, config.upstream_port);
-    let proxy_app = TcpProxyApp::new(
-        BasicPeer::new(&upstream_addr.clone()),
-        config.stream_buf_size,
-    );
+    let proxy_app = TcpProxyApp::new(config.upstream_addr.clone(), config.buf_size);
 
-    let listen_addr = format!("{}:{}", config.advertise_host, config.advertise_port);
     let proxy_service = Service::with_listeners(
-        String::from("etcd-reverse-proxy"),
-        Listeners::tcp(&listen_addr),
+        config.proxy_name,
+        Listeners::tcp(&config.advertise_addr.clone()),
         proxy_app.clone(),
     );
 
@@ -73,8 +66,8 @@ async fn app(config: Config) -> anyhow::Result<()> {
     server.bootstrap();
     server.add_service(proxy_service);
 
-    let client = Client::connect(config.etcd_addr, None).await?;
-    let instance_id = format!("{}:{}", config.advertise_host, config.advertise_port);
+    let client = Client::connect([config.etcd_addr], None).await?;
+    let instance_id = config.advertise_addr.clone();
     let election_config = ElectionConfig {
         leader_key: config.leader_key,
         ttl_second: 60,
@@ -94,7 +87,7 @@ async fn app(config: Config) -> anyhow::Result<()> {
             watch_election_stream,
             &proxy_app,
             instance_id,
-            upstream_addr
+            config.upstream_addr.clone()
         )
     )?;
 
@@ -103,7 +96,7 @@ async fn app(config: Config) -> anyhow::Result<()> {
 
 async fn upstream_updater(
     watch_election_stream: WatchStream,
-    proxy: &TcpProxyApp<BasicPeer>,
+    proxy: &TcpProxyApp,
     instance_id: String,
     upstream_addr: String,
 ) -> anyhow::Result<()> {
@@ -128,9 +121,7 @@ async fn upstream_updater(
                     } else {
                         leader_id
                     };
-                    proxy
-                        .set_upstream_peer(BasicPeer::new(&new_upstream_addr))
-                        .await;
+                    proxy.set_upstream_addr(new_upstream_addr).await;
                 }
                 _ => continue,
             }
