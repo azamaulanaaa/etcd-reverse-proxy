@@ -16,3 +16,9 @@ simple_logger = "5.1"
 thiserror = "2.0"
 tokio = { version = "1", features = ["net", "time"] }
 toml = "0.9"
+
+[workspace.metadata.cross.build]
+zig = true
+pre-build = [
+  "apt-get update && apt-get --assume-yes install cmake protobuf-compiler",
+]
