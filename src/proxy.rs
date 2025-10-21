@@ -31,7 +31,7 @@ where
         }
     }
 
-    pub async fn set_upstream_peer(&mut self, new_upstream_peer: P) {
+    pub async fn set_upstream_peer(&self, new_upstream_peer: P) {
         let mut upstream_state = self.upstream_state.lock().await;
         upstream_state.peer = new_upstream_peer;
         upstream_state.id = upstream_state.id.checked_add(1).unwrap_or(0);
