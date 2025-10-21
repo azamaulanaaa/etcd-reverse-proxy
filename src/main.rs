@@ -71,13 +71,12 @@ async fn app(config: Config) -> anyhow::Result<()> {
     );
     server.add_service(proxy_service);
 
-    let etcd_client = Client::connect([config.etcd_addr], None).await?;
     let election_app = ElectionApp::new(
         config.advertise_addr,
         config.upstream_addr,
         proxy_app.clone(),
         config.leader_key,
-        etcd_client,
+        config.etcd_addr,
     );
     let election_service = background_service("election", election_app);
     server.add_service(election_service);
@@ -90,6 +89,7 @@ struct ElectionApp {
     upstream_addr: String,
     proxy_app: TcpProxyApp,
     election: Election,
+    etcd_addr: String,
 }
 
 impl ElectionApp {
@@ -98,25 +98,26 @@ impl ElectionApp {
         upstream_addr: String,
         proxy_app: TcpProxyApp,
         leader_key: String,
-        etcd_client: Client,
+        etcd_addr: String,
     ) -> Self {
         let election_config = ElectionConfig {
             leader_key: leader_key,
             ttl_second: 60,
             timeout: Duration::from_secs(30),
         };
-        let election = Election::new(instance_id.clone(), etcd_client, election_config);
+        let election = Election::new(instance_id.clone(), election_config);
 
         ElectionApp {
             instance_id,
             upstream_addr,
             proxy_app,
             election,
+            etcd_addr,
         }
     }
 
-    async fn watch(&self) -> anyhow::Result<()> {
-        let mut watch_stream = self.election.watch().await?;
+    async fn watch(&self, etcd_client: Client) -> anyhow::Result<()> {
+        let mut watch_stream = self.election.watch(etcd_client).await?;
 
         while let Some(resp) = watch_stream
             .message()
@@ -152,13 +153,22 @@ impl ElectionApp {
 #[async_trait]
 impl BackgroundService for ElectionApp {
     async fn start(&self, _shutdown: pingora::server::ShutdownWatch) {
-        let leader_id = self.election.leader_id().await;
+        let etcd_client = Client::connect([self.etcd_addr.clone()], None)
+            .await
+            .context("failed to start etcd client")
+            .unwrap();
+
+        let leader_id = self.election.leader_id(etcd_client.clone()).await;
         if let Ok(Some(leader_id)) = leader_id {
             if leader_id != self.instance_id {
                 self.proxy_app.set_upstream_addr(leader_id).await;
             }
         }
 
-        let _ = tokio::try_join!(self.election.run(), self.watch());
+        let _ = tokio::try_join!(
+            self.election.run(etcd_client.clone()),
+            self.watch(etcd_client.clone())
+        )
+        .unwrap();
     }
 }
