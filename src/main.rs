@@ -27,8 +27,7 @@ struct Args {
     verbose: bool,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let args = Args::try_parse()?;
 
     let log_level = if args.verbose {
@@ -44,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
         config
     };
 
-    app(config).await?;
+    app(config)?;
 
     Ok(())
 }
@@ -59,7 +58,7 @@ struct Config {
     etcd_addr: String,
 }
 
-async fn app(config: Config) -> anyhow::Result<()> {
+fn app(config: Config) -> anyhow::Result<()> {
     let mut server = Server::new(None)?;
     server.bootstrap();
 
