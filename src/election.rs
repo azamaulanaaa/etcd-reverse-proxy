@@ -2,6 +2,7 @@ use tokio::time::{Duration, sleep};
 
 use anyhow::Context;
 use etcd_client::{Client, Compare, CompareOp, PutOptions, Txn, TxnOp};
+pub use etcd_client::{Event, EventType, WatchResponse, WatchStream};
 
 pub struct ElectionConfig {
     pub leader_key: String,
@@ -136,5 +137,17 @@ impl Election {
 
             }
         }
+    }
+
+    pub async fn watch(&mut self) -> anyhow::Result<WatchStream> {
+        let mut watcher_client = self.client.watch_client().clone();
+
+        log::debug!("Watching leader value changes");
+        let (_, stream) = watcher_client
+            .watch(self.config.leader_key.clone(), None)
+            .await
+            .context("Failed to start watch")?;
+
+        return Ok(stream);
     }
 }
