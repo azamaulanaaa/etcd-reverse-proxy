@@ -7,7 +7,7 @@ use pingora::{
 };
 use tokio::{io::copy_bidirectional_with_sizes, sync::Mutex};
 
-pub struct TcpProxy<P>
+pub struct TcpProxyApp<P>
 where
     P: Peer + Send + Sync + 'static,
 {
@@ -16,7 +16,7 @@ where
     buf_size: usize,
 }
 
-impl<P> TcpProxy<P>
+impl<P> TcpProxyApp<P>
 where
     P: Peer + Send + Sync + 'static,
 {
@@ -72,7 +72,7 @@ where
 }
 
 #[async_trait]
-impl<P> pingora::apps::ServerApp for TcpProxy<P>
+impl<P> pingora::apps::ServerApp for TcpProxyApp<P>
 where
     P: Peer + Send + Sync + 'static,
 {
