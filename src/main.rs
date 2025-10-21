@@ -4,10 +4,16 @@ mod proxy;
 use std::{fs, time::Duration};
 
 use anyhow::Context;
+use async_trait::async_trait;
 use clap::Parser;
 use election::{Election, ElectionConfig, EventType};
-use etcd_client::{Client, WatchStream};
-use pingora::{listeners::Listeners, server::Server, services::listening::Service};
+use etcd_client::Client;
+use pingora::{
+    listeners::Listeners,
+    prelude::background_service,
+    server::Server,
+    services::{background::BackgroundService, listening::Service},
+};
 use proxy::TcpProxyApp;
 use serde::Deserialize;
 use simple_logger::SimpleLogger;
@@ -45,7 +51,6 @@ async fn main() -> anyhow::Result<()> {
 
 #[derive(Deserialize)]
 struct Config {
-    proxy_name: String,
     advertise_addr: String,
     upstream_addr: String,
     buf_size: usize,
@@ -55,89 +60,105 @@ struct Config {
 }
 
 async fn app(config: Config) -> anyhow::Result<()> {
-    let client = Client::connect([config.etcd_addr], None).await?;
-    let instance_id = config.advertise_addr.clone();
-    let election_config = ElectionConfig {
-        leader_key: config.leader_key,
-        ttl_second: 60,
-        timeout: Duration::from_secs(30),
-    };
-    let election = Election::new(instance_id.clone(), client, election_config);
-    let watch_election_stream = election.watch().await?;
+    let mut server = Server::new(None)?;
+    server.bootstrap();
 
-    let proxy_app = {
-        let leader_id_option = election.leader_id().await?;
-        let init_upstream_addr = if let Some(leader_id) = leader_id_option
-            && leader_id != instance_id
-        {
-            leader_id
-        } else {
-            config.upstream_addr.clone()
-        };
-
-        TcpProxyApp::new(init_upstream_addr, config.buf_size)
-    };
+    let proxy_app = TcpProxyApp::new(config.upstream_addr.clone(), config.buf_size);
     let proxy_service = Service::with_listeners(
-        config.proxy_name,
+        String::from("tcp-proxy"),
         Listeners::tcp(&config.advertise_addr.clone()),
         proxy_app.clone(),
     );
-
-    let mut server = Server::new(None)?;
-    server.bootstrap();
     server.add_service(proxy_service);
 
-    tokio::try_join!(
-        async {
-            let handle = tokio::spawn(async { server.run_forever() });
-            handle.await?;
-            Ok(())
-        },
-        election.run(),
-        upstream_updater(
-            watch_election_stream,
-            &proxy_app,
-            instance_id,
-            config.upstream_addr.clone()
-        )
-    )?;
+    let etcd_client = Client::connect([config.etcd_addr], None).await?;
+    let election_app = ElectionApp::new(
+        config.advertise_addr,
+        config.upstream_addr,
+        proxy_app.clone(),
+        config.leader_key,
+        etcd_client,
+    );
+    let election_service = background_service("election", election_app);
+    server.add_service(election_service);
 
-    Ok(())
+    server.run_forever();
 }
 
-async fn upstream_updater(
-    watch_election_stream: WatchStream,
-    proxy: &TcpProxyApp,
+struct ElectionApp {
     instance_id: String,
     upstream_addr: String,
-) -> anyhow::Result<()> {
-    let mut watch_election_stream = watch_election_stream;
-    while let Some(resp) = watch_election_stream
-        .message()
-        .await
-        .context("Watcher stream is failed")?
-    {
-        for event in resp.events() {
-            match event.event_type() {
-                EventType::Put => {
-                    let leader_id = event
-                        .kv()
-                        .context("key value not found")?
-                        .value_str()
-                        .context("value is not valid string")?
-                        .to_string();
+    proxy_app: TcpProxyApp,
+    election: Election,
+}
 
-                    let new_upstream_addr = if leader_id == instance_id {
-                        upstream_addr.clone()
-                    } else {
-                        leader_id
-                    };
-                    proxy.set_upstream_addr(new_upstream_addr).await;
-                }
-                _ => continue,
-            }
+impl ElectionApp {
+    fn new(
+        instance_id: String,
+        upstream_addr: String,
+        proxy_app: TcpProxyApp,
+        leader_key: String,
+        etcd_client: Client,
+    ) -> Self {
+        let election_config = ElectionConfig {
+            leader_key: leader_key,
+            ttl_second: 60,
+            timeout: Duration::from_secs(30),
+        };
+        let election = Election::new(instance_id.clone(), etcd_client, election_config);
+
+        ElectionApp {
+            instance_id,
+            upstream_addr,
+            proxy_app,
+            election,
         }
     }
 
-    Ok(())
+    async fn watch(&self) -> anyhow::Result<()> {
+        let mut watch_stream = self.election.watch().await?;
+
+        while let Some(resp) = watch_stream
+            .message()
+            .await
+            .context("Watcher stream is failed")?
+        {
+            for event in resp.events() {
+                match event.event_type() {
+                    EventType::Put => {
+                        let leader_id = event
+                            .kv()
+                            .context("key value not found")?
+                            .value_str()
+                            .context("value is not valid string")?
+                            .to_string();
+
+                        let new_upstream_addr = if leader_id == self.instance_id {
+                            self.upstream_addr.clone()
+                        } else {
+                            leader_id
+                        };
+                        self.proxy_app.set_upstream_addr(new_upstream_addr).await;
+                    }
+                    _ => continue,
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl BackgroundService for ElectionApp {
+    async fn start(&self, _shutdown: pingora::server::ShutdownWatch) {
+        let leader_id = self.election.leader_id().await;
+        if let Ok(Some(leader_id)) = leader_id {
+            if leader_id != self.instance_id {
+                self.proxy_app.set_upstream_addr(leader_id).await;
+            }
+        }
+
+        let _ = tokio::try_join!(self.election.run(), self.watch());
+    }
 }
