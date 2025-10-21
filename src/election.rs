@@ -1,3 +1,5 @@
+use std::ops::Add;
+
 use tokio::time::{Duration, sleep};
 
 use anyhow::Context;
@@ -23,7 +25,7 @@ impl Election {
             instance_id,
             client,
             config,
-            retry_delay: Duration::from_millis(rand::random_range(60..=60 * 1000)),
+            retry_delay: Duration::from_millis(rand::random_range(1..=5 * 1000)),
         }
     }
 
@@ -57,7 +59,11 @@ impl Election {
             }
 
             let _ = self.client.lease_client().revoke(lease_id).await;
-            sleep(self.retry_delay).await;
+            sleep(
+                self.retry_delay
+                    .add(Duration::from_secs(self.config.ttl_second.into())),
+            )
+            .await;
         }
     }
 
