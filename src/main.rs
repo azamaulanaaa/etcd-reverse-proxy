@@ -1,4 +1,5 @@
 mod election;
+mod proxy;
 
 use std::time::Duration;
 
