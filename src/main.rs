@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
     let log_level = if args.verbose {
         log::LevelFilter::Debug
     } else {
-        log::LevelFilter::Error
+        log::LevelFilter::Info
     };
     SimpleLogger::new().with_level(log_level).init()?;
 
