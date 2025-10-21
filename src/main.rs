@@ -1,3 +1,5 @@
+mod election;
+
 use clap::Parser;
 use simple_logger::SimpleLogger;
 
