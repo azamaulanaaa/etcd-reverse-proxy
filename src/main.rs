@@ -1,7 +1,7 @@
 mod election;
 mod proxy;
 
-use std::time::Duration;
+use std::{fs, time::Duration};
 
 use anyhow::Context;
 use clap::Parser;
@@ -9,11 +9,14 @@ use election::{Election, ElectionConfig, EventType};
 use etcd_client::{Client, WatchStream};
 use pingora::{listeners::Listeners, server::Server, services::listening::Service};
 use proxy::TcpProxyApp;
+use serde::Deserialize;
 use simple_logger::SimpleLogger;
 
 #[derive(clap::Parser, Debug)]
 #[command(version)]
 struct Args {
+    #[arg(short, long, help = "path of config file")]
+    config: String,
     #[arg(long, default_value_t = false, help = "Set logger to debug mode")]
     verbose: bool,
 }
@@ -29,20 +32,18 @@ async fn main() -> anyhow::Result<()> {
     };
     SimpleLogger::new().with_level(log_level).init()?;
 
-    app(Config {
-        proxy_name: String::from("etcd"),
-        advertise_addr: String::from("0.0.0.0:8080"),
-        upstream_addr: String::from("node-01-etcd:2379"),
+    let config = {
+        let content = fs::read_to_string(args.config)?;
+        let config: Config = toml::from_str(&content)?;
+        config
+    };
 
-        leader_key: String::from("etcd-reverse-proxy/leader"),
-        etcd_addr: String::from("node-01-etcd:2379"),
-        buf_size: 8 * 1024,
-    })
-    .await?;
+    app(config).await?;
 
     Ok(())
 }
 
+#[derive(Deserialize)]
 struct Config {
     proxy_name: String,
     advertise_addr: String,
@@ -54,18 +55,6 @@ struct Config {
 }
 
 async fn app(config: Config) -> anyhow::Result<()> {
-    let proxy_app = TcpProxyApp::new(config.upstream_addr.clone(), config.buf_size);
-
-    let proxy_service = Service::with_listeners(
-        config.proxy_name,
-        Listeners::tcp(&config.advertise_addr.clone()),
-        proxy_app.clone(),
-    );
-
-    let mut server = Server::new(None)?;
-    server.bootstrap();
-    server.add_service(proxy_service);
-
     let client = Client::connect([config.etcd_addr], None).await?;
     let instance_id = config.advertise_addr.clone();
     let election_config = ElectionConfig {
@@ -75,6 +64,28 @@ async fn app(config: Config) -> anyhow::Result<()> {
     };
     let election = Election::new(instance_id.clone(), client, election_config);
     let watch_election_stream = election.watch().await?;
+
+    let proxy_app = {
+        let leader_id_option = election.leader_id().await?;
+        let init_upstream_addr = if let Some(leader_id) = leader_id_option
+            && leader_id != instance_id
+        {
+            leader_id
+        } else {
+            config.upstream_addr.clone()
+        };
+
+        TcpProxyApp::new(init_upstream_addr, config.buf_size)
+    };
+    let proxy_service = Service::with_listeners(
+        config.proxy_name,
+        Listeners::tcp(&config.advertise_addr.clone()),
+        proxy_app.clone(),
+    );
+
+    let mut server = Server::new(None)?;
+    server.bootstrap();
+    server.add_service(proxy_service);
 
     tokio::try_join!(
         async {
