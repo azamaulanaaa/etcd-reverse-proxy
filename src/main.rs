@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use clap::Parser;
 use election::{Election, ElectionConfig, EventType};
 use etcd_client::Client;
+use mlua::{FromLua, Lua};
 use pingora::{
     listeners::Listeners,
     prelude::background_service,
@@ -39,7 +40,11 @@ fn main() -> anyhow::Result<()> {
 
     let config = {
         let content = fs::read_to_string(args.config)?;
-        let config: Config = toml::from_str(&content)?;
+
+        let lua = Lua::new();
+        let config_raw = lua.load(&content).eval()?;
+        let config = Config::from_lua(config_raw, &lua)?;
+
         config
     };
 
@@ -48,7 +53,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct Config {
     advertise_addr: String,
     upstream_addr: String,
@@ -56,6 +61,22 @@ struct Config {
 
     leader_key: String,
     etcd_addr: String,
+}
+
+impl FromLua for Config {
+    fn from_lua(value: mlua::Value, lua: &Lua) -> mlua::Result<Self> {
+        let table = mlua::Table::from_lua(value, lua)?;
+
+        let config = Config {
+            advertise_addr: table.get("advertise_addr")?,
+            upstream_addr: table.get("upstream_addr")?,
+            buf_size: table.get("buf_size")?,
+            leader_key: table.get("leader_key")?,
+            etcd_addr: table.get("etcd_addr")?,
+        };
+
+        Ok(config)
+    }
 }
 
 fn app(config: Config) -> anyhow::Result<()> {
