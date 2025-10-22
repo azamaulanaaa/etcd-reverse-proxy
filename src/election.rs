@@ -112,7 +112,6 @@ impl Election {
     }
 
     async fn maintain_leadership(&self, lease_id: i64, etcd_client: Client) -> anyhow::Result<()> {
-        let keepalive_timeout = self.config.heartbeat_interval.div_f64(2.0);
         let mut lease_client = etcd_client.lease_client();
 
         log::debug!("Start KeepAlive");
@@ -134,7 +133,7 @@ impl Election {
                     match renewal {
                         Ok(Some(_)) => {
                             log::debug!("KeepAlive's response recieved");
-                            sleep(keepalive_timeout).await;
+                            sleep(self.config.heartbeat_interval.div_f64(2.0)).await;
                         }
                         Ok(None) => {
                             return Err(anyhow::anyhow!("KeepAlive stream closed by etcd (possible loss of leadership)" ));
@@ -144,7 +143,7 @@ impl Election {
                         }
                     }
                 }
-                _ = sleep(keepalive_timeout) => {
+                _ = sleep(self.config.heartbeat_interval) => {
                     return Err(anyhow::anyhow!("Timeout waiting for KeepAlive responses"));
                 }
 
