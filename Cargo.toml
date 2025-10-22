@@ -20,7 +20,7 @@ rand = "0.9.2"
 serde = { version = "1.0", features = ["derive"] }
 simple_logger = "5.1"
 thiserror = "2.0"
-tokio = { version = "1", features = ["net", "time"] }
+tokio = { version = "1", features = ["net", "time", "sync", "rt"] }
 
 [workspace.metadata.cross.build]
 zig = true

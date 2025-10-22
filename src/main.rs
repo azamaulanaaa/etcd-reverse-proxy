@@ -1,4 +1,5 @@
 mod election;
+mod lua;
 mod proxy;
 
 use std::{fs, time::Duration};
@@ -8,7 +9,6 @@ use async_trait::async_trait;
 use clap::Parser;
 use election::{Election, ElectionConfig, EventType};
 use etcd_client::Client;
-use mlua::{FromLua, Lua};
 use pingora::{
     listeners::Listeners,
     prelude::background_service,
@@ -18,6 +18,9 @@ use pingora::{
 use proxy::TcpProxyApp;
 use serde::Deserialize;
 use simple_logger::SimpleLogger;
+use tokio::sync::{mpsc, oneshot};
+
+use crate::lua::{LuaApp, LuaHook};
 
 #[derive(clap::Parser, Debug)]
 #[command(version)]
@@ -38,22 +41,14 @@ fn main() -> anyhow::Result<()> {
     };
     SimpleLogger::new().with_level(log_level).init()?;
 
-    let config = {
-        let content = fs::read_to_string(args.config)?;
+    let config_source = fs::read_to_string(args.config)?;
 
-        let lua = Lua::new();
-        let config_raw = lua.load(&content).eval()?;
-        let config = Config::from_lua(config_raw, &lua)?;
-
-        config
-    };
-
-    app(config)?;
+    app(config_source)?;
 
     Ok(())
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Debug)]
 struct Config {
     advertise_addr: String,
     upstream_addr: String,
@@ -63,25 +58,15 @@ struct Config {
     etcd_addr: String,
 }
 
-impl FromLua for Config {
-    fn from_lua(value: mlua::Value, lua: &Lua) -> mlua::Result<Self> {
-        let table = mlua::Table::from_lua(value, lua)?;
+fn app(config_source: String) -> anyhow::Result<()> {
+    let config = LuaApp::config::<Config>(config_source.clone())?;
 
-        let config = Config {
-            advertise_addr: table.get("advertise_addr")?,
-            upstream_addr: table.get("upstream_addr")?,
-            buf_size: table.get("buf_size")?,
-            leader_key: table.get("leader_key")?,
-            etcd_addr: table.get("etcd_addr")?,
-        };
-
-        Ok(config)
-    }
-}
-
-fn app(config: Config) -> anyhow::Result<()> {
     let mut server = Server::new(None)?;
     server.bootstrap();
+
+    let (lua_app, tx_hook) = LuaApp::new(config_source);
+    let lua_service = background_service("lua", lua_app);
+    server.add_service(lua_service);
 
     let proxy_app = TcpProxyApp::new(config.upstream_addr.clone(), config.buf_size);
     let proxy_service = Service::with_listeners(
@@ -97,6 +82,7 @@ fn app(config: Config) -> anyhow::Result<()> {
         proxy_app.clone(),
         config.leader_key,
         config.etcd_addr,
+        tx_hook,
     );
     let election_service = background_service("election", election_app);
     server.add_service(election_service);
@@ -110,6 +96,7 @@ struct ElectionApp {
     proxy_app: TcpProxyApp,
     election: Election,
     etcd_addr: String,
+    tx_hook: mpsc::Sender<LuaHook>,
 }
 
 impl ElectionApp {
@@ -119,6 +106,7 @@ impl ElectionApp {
         proxy_app: TcpProxyApp,
         leader_key: String,
         etcd_addr: String,
+        tx_hook: mpsc::Sender<LuaHook>,
     ) -> Self {
         let election_config = ElectionConfig {
             leader_key: leader_key,
@@ -133,6 +121,7 @@ impl ElectionApp {
             proxy_app,
             election,
             etcd_addr,
+            tx_hook,
         }
     }
 
@@ -153,6 +142,16 @@ impl ElectionApp {
                             .value_str()
                             .context("value is not valid string")?
                             .to_string();
+
+                        let (tx_res, rx_res) = oneshot::channel();
+                        let _ = self
+                            .tx_hook
+                            .send(LuaHook::OnChange {
+                                leader_id: leader_id.clone(),
+                                tx_res,
+                            })
+                            .await?;
+                        let _ = rx_res.await?;
 
                         let new_upstream_addr = if leader_id == self.instance_id {
                             self.upstream_addr.clone()
