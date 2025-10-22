@@ -213,6 +213,20 @@ impl ElectionApp {
         }
     }
 
+    async fn call_on_change(&self, leader_id: String) -> anyhow::Result<()> {
+        let (tx_res, rx_res) = oneshot::channel();
+        let _ = self
+            .tx_hook
+            .send(LuaHook::OnChange { leader_id, tx_res })
+            .await
+            .context("Failed to send hook's on change call request")?;
+        let _ = rx_res
+            .await
+            .context("Failed to receive hook's on change response")?;
+
+        Ok(())
+    }
+
     async fn watch(&self, etcd_client: Client) -> anyhow::Result<()> {
         let mut watch_stream = self
             .election
@@ -235,18 +249,7 @@ impl ElectionApp {
                             .context("Value is not valid string")?
                             .to_string();
 
-                        let (tx_res, rx_res) = oneshot::channel();
-                        let _ = self
-                            .tx_hook
-                            .send(LuaHook::OnChange {
-                                leader_id: leader_id.clone(),
-                                tx_res,
-                            })
-                            .await
-                            .context("Failed to send hook's on change call request")?;
-                        let _ = rx_res
-                            .await
-                            .context("Failed to receive hook's on change response")?;
+                        self.call_on_change(leader_id.clone()).await?;
 
                         let new_upstream_addr = if leader_id == self.instance_id {
                             self.upstream_addr.clone()
