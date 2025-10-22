@@ -269,6 +269,7 @@ impl ElectionApp {
 #[async_trait]
 impl BackgroundService for ElectionApp {
     async fn start(&self, _shutdown: pingora::server::ShutdownWatch) {
+        log::debug!("Crate an etcd client");
         let etcd_client = Client::connect([self.etcd_addr.clone()], None)
             .await
             .context("Failed to start etcd client");
@@ -280,6 +281,7 @@ impl BackgroundService for ElectionApp {
             }
         };
 
+        log::debug!("Get stored leader id");
         let leader_id = self.election.leader_id(etcd_client.clone()).await;
         if let Ok(Some(leader_id)) = leader_id {
             if leader_id != self.instance_id {
@@ -287,6 +289,7 @@ impl BackgroundService for ElectionApp {
             }
         }
 
+        log::debug!("Start election cycle and watcher");
         let result = tokio::try_join!(
             self.election.run(etcd_client.clone()),
             self.watch(etcd_client.clone())
