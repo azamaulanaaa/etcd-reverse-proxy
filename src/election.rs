@@ -14,7 +14,7 @@ use tokio::{
 
 pub struct ElectionConfig {
     pub leader_key: String,
-    pub ttl_second: Duration,
+    pub heartbeat_interval: Duration,
     pub timeout: Duration,
 }
 
@@ -66,14 +66,14 @@ impl Election {
             }
 
             let _ = etcd_client.lease_client().revoke(lease_id).await;
-            sleep(self.retry_delay.add(self.config.ttl_second)).await;
+            sleep(self.retry_delay.add(self.config.heartbeat_interval)).await;
         }
     }
 
     async fn create_lease(&self, etcd_client: Client) -> anyhow::Result<i64> {
         let lease_time: i64 = self
             .config
-            .ttl_second
+            .heartbeat_interval
             .as_secs()
             .try_into()
             .context("time to live is not a valid i64 value")?;
@@ -112,7 +112,7 @@ impl Election {
     }
 
     async fn maintain_leadership(&self, lease_id: i64, etcd_client: Client) -> anyhow::Result<()> {
-        let keepalive_timeout = self.config.ttl_second.div_f64(2.0);
+        let keepalive_timeout = self.config.heartbeat_interval.div_f64(2.0);
         let mut lease_client = etcd_client.lease_client();
 
         log::debug!("Start KeepAlive");
@@ -202,7 +202,7 @@ impl ElectionApp {
     ) -> Self {
         let election_config = ElectionConfig {
             leader_key: leader_key,
-            ttl_second: Duration::from_secs(60),
+            heartbeat_interval: Duration::from_secs(60),
             timeout: Duration::from_secs(30),
         };
         let election = Election::new(instance_id.clone(), election_config);
