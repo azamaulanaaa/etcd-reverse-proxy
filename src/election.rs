@@ -1,8 +1,6 @@
 use crate::lua::LuaHook;
 use crate::proxy::TcpProxyApp;
 
-use std::ops::Add;
-
 use anyhow::Context;
 use async_trait::async_trait;
 use etcd_client::{Client, Compare, CompareOp, EventType, PutOptions, Txn, TxnOp, WatchStream};
@@ -16,12 +14,12 @@ pub struct ElectionConfig {
     pub leader_key: String,
     pub heartbeat_interval: Duration,
     pub timeout: Duration,
+    pub random_delay: Duration,
 }
 
 pub struct Election {
     instance_id: String,
     config: ElectionConfig,
-    retry_delay: Duration,
 }
 
 impl Election {
@@ -29,7 +27,6 @@ impl Election {
         Self {
             instance_id,
             config,
-            retry_delay: Duration::from_millis(rand::random_range(1..=5 * 1000)),
         }
     }
 
@@ -66,7 +63,7 @@ impl Election {
             }
 
             let _ = etcd_client.lease_client().revoke(lease_id).await;
-            sleep(self.retry_delay.add(self.config.heartbeat_interval)).await;
+            sleep(self.config.heartbeat_interval + self.config.random_delay).await;
         }
     }
 
@@ -202,6 +199,7 @@ impl ElectionApp {
             leader_key: leader_key,
             heartbeat_interval: Duration::from_secs(60),
             timeout: Duration::from_secs(30),
+            random_delay: Duration::from_millis(rand::random_range(100..=5000)),
         };
         let election = Election::new(instance_id.clone(), election_config);
 
