@@ -62,7 +62,7 @@ jobs:
 
   build_arm64:
     name: Build & Push (linux/arm64)
-    runs-on: ubuntu-latest-arm64 
+    runs-on: ubuntu-latest 
     permissions:
       contents: read
       packages: write
@@ -74,6 +74,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
