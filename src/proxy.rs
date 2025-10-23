@@ -41,26 +41,11 @@ impl TcpProxyApp {
     async fn gen_peer(&self, upstream_addr: String) -> anyhow::Result<BasicPeer> {
         let mut addrs = lookup_host(upstream_addr.clone()).await?;
         let first_addr = addrs.nth(0).ok_or(anyhow::anyhow!(
-            "no ip address exist for '{}'",
+            "Failed to resolve '{}'",
             upstream_addr.clone()
         ))?;
         let peer = BasicPeer::new(&first_addr.to_string());
         Ok(peer)
-    }
-
-    async fn duplex(
-        &self,
-        mut server_stream: Stream,
-        mut client_stream: Stream,
-        buf_size: usize,
-    ) -> anyhow::Result<()> {
-        tokio::select! {
-            res = copy_bidirectional_with_sizes(&mut server_stream, &mut client_stream, buf_size, buf_size) => {
-                res.context("Stream duplexing failed")?;
-            }
-        }
-
-        Ok(())
     }
 }
 
@@ -68,9 +53,10 @@ impl TcpProxyApp {
 impl pingora::apps::ServerApp for TcpProxyApp {
     async fn process_new(
         self: &Arc<Self>,
-        server_stream: Stream,
+        mut server_stream: Stream,
         _shutdown: &ShutdownWatch,
     ) -> Option<pingora::protocols::Stream> {
+        log::debug!("Get lastest upstream address");
         let upstream_addr = {
             let (tx_res, rx_res) = oneshot::channel();
             if let Err(e) = self
@@ -103,29 +89,44 @@ impl pingora::apps::ServerApp for TcpProxyApp {
                 return None;
             }
         };
+        log::debug!("Upstream address : {}", upstream_addr);
 
-        let peer = match self.gen_peer(upstream_addr.clone()).await {
+        log::debug!("Generate an upstream peer");
+        let peer = match self
+            .gen_peer(upstream_addr.clone())
+            .await
+            .context("Failed create upstream peer")
+        {
             Ok(peer) => peer,
             Err(e) => {
-                log::error!("unable to create peer: {:?}", e);
+                log::error!("{}", e);
                 return None;
             }
         };
 
-        let client_stream = self.client_connector.new_stream(&peer).await;
-
-        match client_stream {
-            Ok(client_stream) => {
-                if let Err(e) = self
-                    .duplex(server_stream, client_stream, self.buf_size)
-                    .await
-                {
-                    log::error!("duplex stream failed: {:?}", e);
-                }
-            }
+        log::debug!("Start streaming to upstream peer");
+        let client_stream = self
+            .client_connector
+            .new_stream(&peer)
+            .await
+            .context("Create client stream is failed");
+        let mut client_stream = match client_stream {
+            Ok(client_stream) => client_stream,
             Err(e) => {
-                log::error!("create client stream is failed: {:?}", e)
+                log::error!("{}", e);
+                return None;
             }
+        };
+        if let Err(e) = copy_bidirectional_with_sizes(
+            &mut server_stream,
+            &mut client_stream,
+            self.buf_size,
+            self.buf_size,
+        )
+        .await
+        .context("Duplex stream is crash")
+        {
+            log::error!("{}", e);
         }
 
         return None;
