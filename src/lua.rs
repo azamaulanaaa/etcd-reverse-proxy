@@ -19,9 +19,9 @@ impl LuaHook {
             args.set("leader_id", leader_id)
                 .context("Failed to set args 'leader_id'")?;
 
-            let out = on_change.call::<()>(args)?;
+            on_change.call::<()>(args)?;
 
-            return Ok(out);
+            return Ok(());
         }
 
         Ok(())

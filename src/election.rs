@@ -217,8 +217,7 @@ impl Election {
             .await
             .context("Failed to get leader id")?;
         let value = resp
-            .kvs()
-            .get(0)
+            .kvs().first()
             .map(|kv| kv.value_str())
             .transpose()?
             .map(|s| s.to_owned());
@@ -239,7 +238,7 @@ impl ElectionApp {
         etcd_addr: String,
     ) -> (Self, mpsc::Receiver<ElectionEvent>) {
         let election_config = ElectionConfig {
-            leader_key: leader_key,
+            leader_key,
             heartbeat_interval: Duration::from_secs(60),
         };
         let (election, rx_event) = Election::new(instance_id.clone(), election_config);

@@ -58,7 +58,7 @@ struct Config {
 fn app(config_path: String) -> anyhow::Result<()> {
     let config_path = Path::new(&config_path);
 
-    let luae = LuaE::init(&config_path)?;
+    let luae = LuaE::init(config_path)?;
     let config = luae.config::<Config>()?;
 
     let mut server = Server::new(None)?;

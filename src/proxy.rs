@@ -72,15 +72,15 @@ impl pingora::apps::ServerApp for TcpProxyApp {
                 .await
                 .context("Failed to receive get upstream addr")
                 .flatten();
-            let upstream_addr = match upstream_addr {
+            
+
+            match upstream_addr {
                 Ok(v) => v,
                 Err(e) => {
                     log::error!("{}", e);
                     return None;
                 }
-            };
-
-            upstream_addr
+            }
         };
         let upstream_addr = match upstream_addr {
             Some(v) => v,
