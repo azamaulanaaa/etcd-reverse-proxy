@@ -4,12 +4,11 @@ mod proxy;
 
 use crate::{
     election::{ElectionApp, ElectionEvent},
-    lua::{LuaApp, LuaCommand},
+    lua::LuaE,
     proxy::{TcpProxyApp, TcpProxyConfig},
 };
-use std::fs;
+use std::{fmt::Debug, fs};
 
-use anyhow::Context;
 use async_trait::async_trait;
 use clap::Parser;
 use pingora::{
@@ -20,7 +19,7 @@ use pingora::{
 };
 use serde::Deserialize;
 use simple_logger::SimpleLogger;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc};
 
 #[derive(clap::Parser, Debug)]
 #[command(version)]
@@ -48,7 +47,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 struct Config {
     advertise_addr: String,
     upstream_addr: String,
@@ -59,14 +58,11 @@ struct Config {
 }
 
 fn app(config_source: String) -> anyhow::Result<()> {
-    let config = LuaApp::config::<Config>(config_source.clone())?;
+    let luae = LuaE::init(config_source.clone())?;
+    let config = luae.config::<Config>()?;
 
     let mut server = Server::new(None)?;
     server.bootstrap();
-
-    let (lua_app, tx_lua_command) = LuaApp::new(config_source);
-    let lua_service = background_service("lua", lua_app);
-    server.add_service(lua_service);
 
     let (proxy_app, rx_proxy_config) = TcpProxyApp::new(config.buf_size);
     let proxy_service = Service::with_listeners(
@@ -85,13 +81,13 @@ fn app(config_source: String) -> anyhow::Result<()> {
     server.add_service(election_service);
 
     let bridge = Bridge {
+        luae,
         state: Mutex::new(BridgeState {
             upstream_addr: None,
         }),
         instance_id: config.advertise_addr,
         local_upstream_addr: config.upstream_addr,
         rx_proxy_config: Mutex::new(rx_proxy_config),
-        tx_lua_command,
         rx_election_event: Mutex::new(rx_election_event),
     };
     let bridge_service = background_service("brider", bridge);
@@ -105,46 +101,13 @@ struct BridgeState {
 }
 
 struct Bridge {
+    luae: LuaE,
     state: Mutex<BridgeState>,
     instance_id: String,
     local_upstream_addr: String,
     rx_proxy_config: Mutex<mpsc::Receiver<TcpProxyConfig>>,
-    tx_lua_command: mpsc::Sender<LuaCommand>,
     rx_election_event: Mutex<mpsc::Receiver<ElectionEvent>>,
 }
-
-impl Bridge {
-    async fn call_on_change(&self, leader_id: Option<String>) -> anyhow::Result<()> {
-        {
-            let new_upstream_addr = if Some(self.instance_id.clone()) == leader_id {
-                Some(self.local_upstream_addr.clone())
-            } else {
-                leader_id.clone()
-            };
-
-            let mut state = self.state.lock().await;
-            state.upstream_addr = new_upstream_addr;
-        }
-
-        {
-            let (tx_res, rx_res) = oneshot::channel();
-            let _ = self
-                .tx_lua_command
-                .send(LuaCommand::OnChange {
-                    leader_id: leader_id.unwrap(),
-                    tx_res,
-                })
-                .await
-                .context("Failed to call hook's on change")?;
-            let _ = rx_res
-                .await
-                .context("Failed to receive hook's on change response")?;
-        }
-
-        Ok(())
-    }
-}
-
 #[async_trait]
 impl BackgroundService for Bridge {
     async fn start(&self, _shutdown: pingora::server::ShutdownWatch) {
@@ -166,7 +129,18 @@ impl BackgroundService for Bridge {
                 Some(election_event) = rx_election_event.recv() => {
                     match election_event {
                         ElectionEvent::LeaderChanged { leader_id } => {
-                            if let Err(e) = self.call_on_change(leader_id).await {
+                            {
+                                let new_upstream_addr = if Some(self.instance_id.clone()) == leader_id {
+                                    Some(self.local_upstream_addr.clone())
+                                } else {
+                                    leader_id.clone()
+                                };
+
+                                let mut state = self.state.lock().await;
+                                state.upstream_addr = new_upstream_addr;
+                            }
+
+                            if let Err(e) = self.luae.hook().on_change(leader_id) {
                                 log::error!("{}", e);
                             }
                         }
