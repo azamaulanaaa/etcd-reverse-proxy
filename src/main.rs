@@ -4,7 +4,7 @@ mod proxy;
 
 use crate::{
     election::{ElectionApp, ElectionEvent},
-    lua::{LuaApp, LuaHook},
+    lua::{LuaApp, LuaCommand},
     proxy::{TcpProxyApp, TcpProxyConfig},
 };
 use std::fs;
@@ -64,7 +64,7 @@ fn app(config_source: String) -> anyhow::Result<()> {
     let mut server = Server::new(None)?;
     server.bootstrap();
 
-    let (lua_app, tx_hook) = LuaApp::new(config_source);
+    let (lua_app, tx_lua_command) = LuaApp::new(config_source);
     let lua_service = background_service("lua", lua_app);
     server.add_service(lua_service);
 
@@ -91,7 +91,7 @@ fn app(config_source: String) -> anyhow::Result<()> {
         instance_id: config.advertise_addr,
         local_upstream_addr: config.upstream_addr,
         rx_proxy_config: Mutex::new(rx_proxy_config),
-        tx_lua_hook: tx_hook,
+        tx_lua_command,
         rx_election_event: Mutex::new(rx_election_event),
     };
     let bridge_service = background_service("brider", bridge);
@@ -109,7 +109,7 @@ struct Bridge {
     instance_id: String,
     local_upstream_addr: String,
     rx_proxy_config: Mutex<mpsc::Receiver<TcpProxyConfig>>,
-    tx_lua_hook: mpsc::Sender<LuaHook>,
+    tx_lua_command: mpsc::Sender<LuaCommand>,
     rx_election_event: Mutex<mpsc::Receiver<ElectionEvent>>,
 }
 
@@ -129,8 +129,8 @@ impl Bridge {
         {
             let (tx_res, rx_res) = oneshot::channel();
             let _ = self
-                .tx_lua_hook
-                .send(LuaHook::OnChange {
+                .tx_lua_command
+                .send(LuaCommand::OnChange {
                     leader_id: leader_id.unwrap(),
                     tx_res,
                 })
