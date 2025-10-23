@@ -11,13 +11,15 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  get_metadata:
+  meta:
     name: Generate Container Metadata
     runs-on: ubuntu-latest
     outputs:
       tags: ${{ steps.meta.outputs.tags }}
       labels: ${{ steps.meta.outputs.labels }}
-      base_tag: ${{ steps.meta.outputs.tags }}
+      version: ${{ steps.meta.outputs.version }}
+      metadata_json: ${{ steps.meta.outputs.json }}
+      image_name: ${{ steps.meta.outputs.image }}
       
     steps:
       - name: Checkout repository (required for semver tag discovery)
@@ -33,101 +35,93 @@ jobs:
             type=semver,pattern={{major}}
             type=semver,pattern={{major}}.{{minor}}
 
-  build_amd64:
-    name: Build & Push (linux/amd64)
+  build:
     runs-on: ubuntu-latest
-    needs: [get_metadata]
+    needs: 
+      - meta
     permissions:
       contents: read
       packages: write
-    outputs:
-      tags: ${{ steps.meta.outputs.tags }}
-
+    strategy:
+      fail-fast: true
+      matrix:
+        platform:
+          - linux/amd64
+          - linux/arm64
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Prepare
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        
       - name: Log in to the Container registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push AMD64 image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          labels: ${{ needs.get_metadata.outputs.labels }}
-          tags: ${{ needs.get_metadata.outputs.tags }}-amd64
-          platforms: linux/amd64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  build_arm64:
-    name: Build & Push (linux/arm64)
-    runs-on: ubuntu-latest 
-    needs: [get_metadata]
-    permissions:
-      contents: read
-      packages: write
-      
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
-        with:
-          platforms: linux/arm64
+        if: ${{ matrix.platform != 'linux/amd64' }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to the Container registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push ARM64 image
+      - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
-          context: .
-          push: true
-          labels: ${{ needs.get_metadata.outputs.labels }}
-          tags: ${{ needs.get_metadata.outputs.tags }}-arm64
-          platforms: linux/arm64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          platforms: ${{ matrix.platform }}
+          labels: ${{ needs.meta.outputs.labels }}
+          tags: ${{ needs.meta.outputs.tags }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
 
-  create_manifest:
-    name: Create Multi-Arch Manifest
+      - name: Export digest
+        run: |
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
     runs-on: ubuntu-latest
-    needs: [get_metadata, build_amd64, build_arm64] 
-    permissions:
-      contents: read
-      packages: write
-
+    needs:
+      - meta
+      - build
+    env:
+      DOCKER_METADATA_OUTPUT_JSON: ${{ needs.meta.outputs.metadata_json }}
     steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
       - name: Log in to the Container registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-          
-      - name: Create and Push Manifest
-        run: |
-          BASE_TAG=${{ needs.get_metadata.outputs.base_tag }}
 
-          docker manifest create "${BASE_TAG}" \
-            "${BASE_TAG}-amd64" \
-            "${BASE_TAG}-arm64"
-            
-          docker manifest push "${BASE_TAG}"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ needs.meta.outputs.image_name }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ needs.meta.outputs.image_name }}:${{ needs.meta.outputs.version }}
