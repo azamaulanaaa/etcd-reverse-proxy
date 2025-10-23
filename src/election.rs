@@ -1,14 +1,15 @@
-use crate::lua::LuaHook;
-use crate::proxy::TcpProxyApp;
-
 use anyhow::Context;
 use async_trait::async_trait;
-use etcd_client::{Client, Compare, CompareOp, EventType, PutOptions, Txn, TxnOp, WatchStream};
+use etcd_client::{Client, Compare, CompareOp, PutOptions, Txn, TxnOp};
 use pingora::services::background::BackgroundService;
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::mpsc,
     time::{Duration, sleep},
 };
+
+pub enum ElectionEvent {
+    LeaderChanged { leader_id: Option<String> },
+}
 
 pub struct ElectionConfig {
     pub leader_key: String,
@@ -20,14 +21,24 @@ pub struct ElectionConfig {
 pub struct Election {
     instance_id: String,
     config: ElectionConfig,
+    tx_event: mpsc::Sender<ElectionEvent>,
 }
 
 impl Election {
-    pub fn new(instance_id: String, config: ElectionConfig) -> Self {
-        Self {
-            instance_id,
-            config,
-        }
+    pub fn new(
+        instance_id: String,
+        config: ElectionConfig,
+    ) -> (Self, mpsc::Receiver<ElectionEvent>) {
+        let (tx_event, rx_event) = mpsc::channel::<ElectionEvent>(32);
+
+        (
+            Self {
+                instance_id,
+                config,
+                tx_event,
+            },
+            rx_event,
+        )
     }
 
     pub async fn run(&self, etcd_client: Client) -> anyhow::Result<()> {
@@ -147,16 +158,35 @@ impl Election {
         }
     }
 
-    pub async fn watch(&self, etcd_client: Client) -> anyhow::Result<WatchStream> {
+    pub async fn watch(&self, etcd_client: Client) -> anyhow::Result<()> {
         let mut watcher_client = etcd_client.watch_client().clone();
 
-        log::debug!("Start watcher for leader id changes");
-        let (_, stream) = watcher_client
+        let (_, mut watcher_stream) = watcher_client
             .watch(self.config.leader_key.clone(), None)
             .await
             .context("Failed to start watcher")?;
 
-        return Ok(stream);
+        while let Some(resp) = watcher_stream
+            .message()
+            .await
+            .context("Failed to receive watcher's message")?
+        {
+            for event in resp.events() {
+                let leader_id = event
+                    .kv()
+                    .map(|kv| kv.value_str())
+                    .transpose()
+                    .context("Value is not valid string")?
+                    .map(|v| v.to_string());
+
+                self.tx_event
+                    .send(ElectionEvent::LeaderChanged { leader_id })
+                    .await
+                    .context("Unable to send an election event")?;
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn leader_id(&self, etcd_client: Client) -> anyhow::Result<Option<String>> {
@@ -179,91 +209,32 @@ impl Election {
 
 pub struct ElectionApp {
     instance_id: String,
-    upstream_addr: String,
-    proxy_app: TcpProxyApp,
     election: Election,
     etcd_addr: String,
-    tx_hook: mpsc::Sender<LuaHook>,
 }
 
 impl ElectionApp {
     pub fn new(
         instance_id: String,
-        upstream_addr: String,
-        proxy_app: TcpProxyApp,
         leader_key: String,
         etcd_addr: String,
-        tx_hook: mpsc::Sender<LuaHook>,
-    ) -> Self {
+    ) -> (Self, mpsc::Receiver<ElectionEvent>) {
         let election_config = ElectionConfig {
             leader_key: leader_key,
             heartbeat_interval: Duration::from_secs(60),
             timeout: Duration::from_secs(30),
             random_delay: Duration::from_millis(rand::random_range(100..=5000)),
         };
-        let election = Election::new(instance_id.clone(), election_config);
+        let (election, rx_event) = Election::new(instance_id.clone(), election_config);
 
-        ElectionApp {
-            instance_id,
-            upstream_addr,
-            proxy_app,
-            election,
-            etcd_addr,
-            tx_hook,
-        }
-    }
-
-    async fn call_on_change(&self, leader_id: String) -> anyhow::Result<()> {
-        let (tx_res, rx_res) = oneshot::channel();
-        let _ = self
-            .tx_hook
-            .send(LuaHook::OnChange { leader_id, tx_res })
-            .await
-            .context("Failed to send hook's on change call request")?;
-        let _ = rx_res
-            .await
-            .context("Failed to receive hook's on change response")?;
-
-        Ok(())
-    }
-
-    async fn watch(&self, etcd_client: Client) -> anyhow::Result<()> {
-        let mut watch_stream = self
-            .election
-            .watch(etcd_client)
-            .await
-            .context("Failed to create watcher's stream")?;
-
-        while let Some(resp) = watch_stream
-            .message()
-            .await
-            .context("Failed to receive watcher's message")?
-        {
-            for event in resp.events() {
-                match event.event_type() {
-                    EventType::Put => {
-                        let leader_id = event
-                            .kv()
-                            .context("Key value not found")?
-                            .value_str()
-                            .context("Value is not valid string")?
-                            .to_string();
-
-                        self.call_on_change(leader_id.clone()).await?;
-
-                        let new_upstream_addr = if leader_id == self.instance_id {
-                            self.upstream_addr.clone()
-                        } else {
-                            leader_id
-                        };
-                        self.proxy_app.set_upstream_addr(new_upstream_addr).await;
-                    }
-                    _ => continue,
-                }
-            }
-        }
-
-        Ok(())
+        (
+            ElectionApp {
+                instance_id,
+                election,
+                etcd_addr,
+            },
+            rx_event,
+        )
     }
 }
 
@@ -282,18 +253,10 @@ impl BackgroundService for ElectionApp {
             }
         };
 
-        log::debug!("Get stored leader id");
-        let leader_id = self.election.leader_id(etcd_client.clone()).await;
-        if let Ok(Some(leader_id)) = leader_id {
-            if leader_id != self.instance_id {
-                self.proxy_app.set_upstream_addr(leader_id).await;
-            }
-        }
-
         log::debug!("Start election cycle and watcher");
         let result = tokio::try_join!(
             self.election.run(etcd_client.clone()),
-            self.watch(etcd_client.clone())
+            self.election.watch(etcd_client.clone())
         )
         .context("ElectionApp's background service is crash");
         let _result = match result {
