@@ -1,6 +1,6 @@
 use anyhow::Context;
 use async_trait::async_trait;
-use etcd_client::{Client, Compare, CompareOp, PutOptions, Txn, TxnOp};
+use etcd_client::{Client, Compare, CompareOp, EventType, PutOptions, Txn, TxnOp, WatchStream};
 use pingora::services::background::BackgroundService;
 use tokio::{
     sync::mpsc,
@@ -14,8 +14,6 @@ pub enum ElectionEvent {
 pub struct ElectionConfig {
     pub leader_key: String,
     pub heartbeat_interval: Duration,
-    pub timeout: Duration,
-    pub random_delay: Duration,
 }
 
 pub struct Election {
@@ -42,40 +40,82 @@ impl Election {
     }
 
     pub async fn run(&self, etcd_client: Client) -> anyhow::Result<()> {
-        loop {
-            log::debug!("Request for a lease id");
-            let lease_id = match self.request_lease_id(etcd_client.clone()).await {
-                Ok(id) => id,
-                Err(e) => {
-                    log::error!("Failed to create lease: {}", e);
-                    sleep(self.config.timeout).await;
-                    continue;
-                }
-            };
-            log::debug!("Lease id: {}", lease_id);
+        log::debug!("Start watcher");
+        let mut watch_stream = self
+            .watch(etcd_client.clone())
+            .await
+            .context("Failed to create watcher's stream")?;
 
-            log::debug!("Start a campaign");
-            match self.try_campaign(lease_id, etcd_client.clone()).await {
-                Ok(true) => {
-                    log::info!("Client is a LEADER");
-                    if let Err(e) = self
-                        .maintain_leadership(lease_id, etcd_client.clone())
-                        .await
-                    {
-                        log::warn!("Leader maintenance failed: {}", e);
-                    }
+        let leader_id = self
+            .leader_id(etcd_client.clone())
+            .await
+            .context("Failed to get initial leader id")?;
+        self.tx_event
+            .send(ElectionEvent::LeaderChanged {
+                leader_id: leader_id.clone(),
+            })
+            .await
+            .context("Unable to send an election event")?;
+
+        self.try_campaign(etcd_client.clone()).await?;
+        if Some(self.instance_id.clone()) == leader_id {
+            log::info!("Client is a LEADER");
+        }
+
+        while let Some(resp) = watch_stream
+            .message()
+            .await
+            .context("Failed to receive watcher's message")?
+        {
+            for event in resp.events() {
+                if event.event_type() == EventType::Delete {
+                    self.try_campaign(etcd_client.clone()).await?;
                 }
-                Ok(false) => {
-                    log::info!("Client is a FOLLOWER");
-                }
-                Err(e) => {
-                    log::error!("Campaign failed: {}", e);
+
+                let leader_id = event
+                    .kv()
+                    .map(|kv| kv.value_str())
+                    .transpose()
+                    .context("Value is not valid string")?
+                    .map(|v| v.to_string());
+
+                self.tx_event
+                    .send(ElectionEvent::LeaderChanged { leader_id })
+                    .await
+                    .context("Unable to send an election event")?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn try_campaign(&self, etcd_client: Client) -> anyhow::Result<()> {
+        log::debug!("Request for a lease id");
+        let lease_id = self.request_lease_id(etcd_client.clone()).await?;
+        log::debug!("Lease id: {}", lease_id);
+
+        log::debug!("Start a campaign");
+        match self.ask_for_leadership(lease_id, etcd_client.clone()).await {
+            Ok(true) => {
+                log::info!("Client is a LEADER");
+                if let Err(e) = self
+                    .maintain_leadership(lease_id, etcd_client.clone())
+                    .await
+                {
+                    log::warn!("Leader maintenance failed: {}", e);
                 }
             }
-
-            let _ = etcd_client.lease_client().revoke(lease_id).await;
-            sleep(self.config.heartbeat_interval + self.config.random_delay).await;
+            Ok(false) => {
+                log::info!("Client is a FOLLOWER");
+            }
+            Err(e) => {
+                log::error!("Campaign failed: {}", e);
+            }
         }
+
+        let _ = etcd_client.lease_client().revoke(lease_id).await;
+
+        Ok(())
     }
 
     async fn request_lease_id(&self, etcd_client: Client) -> anyhow::Result<i64> {
@@ -93,7 +133,7 @@ impl Election {
         Ok(resp.id())
     }
 
-    async fn try_campaign(&self, lease_id: i64, etcd_client: Client) -> anyhow::Result<bool> {
+    async fn ask_for_leadership(&self, lease_id: i64, etcd_client: Client) -> anyhow::Result<bool> {
         let compare = Compare::version(self.config.leader_key.clone(), CompareOp::Equal, 0);
 
         let put_options = PutOptions::new().with_lease(lease_id);
@@ -158,35 +198,15 @@ impl Election {
         }
     }
 
-    pub async fn watch(&self, etcd_client: Client) -> anyhow::Result<()> {
+    async fn watch(&self, etcd_client: Client) -> anyhow::Result<WatchStream> {
         let mut watcher_client = etcd_client.watch_client().clone();
 
-        let (_, mut watcher_stream) = watcher_client
+        let (_, watcher_stream) = watcher_client
             .watch(self.config.leader_key.clone(), None)
             .await
             .context("Failed to start watcher")?;
 
-        while let Some(resp) = watcher_stream
-            .message()
-            .await
-            .context("Failed to receive watcher's message")?
-        {
-            for event in resp.events() {
-                let leader_id = event
-                    .kv()
-                    .map(|kv| kv.value_str())
-                    .transpose()
-                    .context("Value is not valid string")?
-                    .map(|v| v.to_string());
-
-                self.tx_event
-                    .send(ElectionEvent::LeaderChanged { leader_id })
-                    .await
-                    .context("Unable to send an election event")?;
-            }
-        }
-
-        Ok(())
+        Ok(watcher_stream)
     }
 
     pub async fn leader_id(&self, etcd_client: Client) -> anyhow::Result<Option<String>> {
@@ -208,7 +228,6 @@ impl Election {
 }
 
 pub struct ElectionApp {
-    instance_id: String,
     election: Election,
     etcd_addr: String,
 }
@@ -222,14 +241,11 @@ impl ElectionApp {
         let election_config = ElectionConfig {
             leader_key: leader_key,
             heartbeat_interval: Duration::from_secs(60),
-            timeout: Duration::from_secs(30),
-            random_delay: Duration::from_millis(rand::random_range(100..=5000)),
         };
         let (election, rx_event) = Election::new(instance_id.clone(), election_config);
 
         (
             ElectionApp {
-                instance_id,
                 election,
                 etcd_addr,
             },
@@ -253,12 +269,13 @@ impl BackgroundService for ElectionApp {
             }
         };
 
-        log::debug!("Start election cycle and watcher");
-        let result = tokio::try_join!(
-            self.election.run(etcd_client.clone()),
-            self.election.watch(etcd_client.clone())
-        )
-        .context("ElectionApp's background service is crash");
+        log::debug!("Start election");
+        let result = self
+            .election
+            .run(etcd_client.clone())
+            .await
+            .context("Election is crash");
+
         let _result = match result {
             Ok(v) => v,
             Err(e) => {
