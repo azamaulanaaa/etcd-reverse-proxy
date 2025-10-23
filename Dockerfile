@@ -20,4 +20,4 @@ WORKDIR /app
 
 COPY --from=builder /app/target/release/etcd-reverse-proxy .
 
-CMD ["/app/etcd-reverse-proxy", "-c", "/config.toml"]
+CMD ["/app/etcd-reverse-proxy", "-c", "config/init.lua"]
