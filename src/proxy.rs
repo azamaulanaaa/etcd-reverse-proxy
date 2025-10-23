@@ -6,39 +6,36 @@ use pingora::{
     connectors::TransportConnector, protocols::Stream, server::ShutdownWatch,
     upstreams::peer::BasicPeer,
 };
-use tokio::{io::copy_bidirectional_with_sizes, net::lookup_host, sync::Mutex};
+use tokio::{
+    io::copy_bidirectional_with_sizes,
+    net::lookup_host,
+    sync::{mpsc, oneshot},
+};
+
+pub enum TcpProxyConfig {
+    GetUpstreamAddr {
+        tx_res: oneshot::Sender<anyhow::Result<Option<String>>>,
+    },
+}
 
 pub struct TcpProxyApp {
-    upstream_addr: Arc<Mutex<String>>,
     client_connector: TransportConnector,
     buf_size: usize,
+    tx_config: mpsc::Sender<TcpProxyConfig>,
 }
 
 impl TcpProxyApp {
-    pub fn new(upstream_addr: String, buf_size: usize) -> Self {
-        Self {
-            upstream_addr: Arc::new(Mutex::new(upstream_addr)),
-            buf_size,
-            client_connector: TransportConnector::new(None),
-        }
-    }
+    pub fn new(buf_size: usize) -> (Self, mpsc::Receiver<TcpProxyConfig>) {
+        let (tx_config, rx_config) = mpsc::channel::<TcpProxyConfig>(32);
 
-    pub async fn set_upstream_addr(&self, new_upstream_addr: String) {
-        let mut upstream_addr = self.upstream_addr.lock().await;
-        *upstream_addr = new_upstream_addr;
-        log::info!("Upstream addr updated");
-    }
-
-    async fn watch_upstream_state_changes(&self, upstream_addr: String) {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
-
-        loop {
-            interval.tick().await;
-            let current_upstream_addr = self.upstream_addr.lock().await;
-            if *current_upstream_addr != upstream_addr {
-                break;
-            }
-        }
+        (
+            Self {
+                buf_size,
+                client_connector: TransportConnector::new(None),
+                tx_config,
+            },
+            rx_config,
+        )
     }
 
     async fn gen_peer(&self, upstream_addr: String) -> anyhow::Result<BasicPeer> {
@@ -56,15 +53,10 @@ impl TcpProxyApp {
         mut server_stream: Stream,
         mut client_stream: Stream,
         buf_size: usize,
-        upstream_addr: String,
     ) -> anyhow::Result<()> {
         tokio::select! {
             res = copy_bidirectional_with_sizes(&mut server_stream, &mut client_stream, buf_size, buf_size) => {
                 res.context("Stream duplexing failed")?;
-            }
-            _ = self.watch_upstream_state_changes(upstream_addr) => {
-                log::info!("Upstream peer changed");
-                return Err(anyhow::anyhow!("Upstream peer configuration changed"));
             }
         }
 
@@ -79,7 +71,39 @@ impl pingora::apps::ServerApp for TcpProxyApp {
         server_stream: Stream,
         _shutdown: &ShutdownWatch,
     ) -> Option<pingora::protocols::Stream> {
-        let upstream_addr = { self.upstream_addr.lock().await.clone() };
+        let upstream_addr = {
+            let (tx_res, rx_res) = oneshot::channel();
+            if let Err(e) = self
+                .tx_config
+                .send(TcpProxyConfig::GetUpstreamAddr { tx_res })
+                .await
+                .context("Failed to call get upstream addr")
+            {
+                log::error!("{}", e);
+                return None;
+            }
+            let upstream_addr = rx_res
+                .await
+                .context("Failed to receive get upstream addr")
+                .flatten();
+            let upstream_addr = match upstream_addr {
+                Ok(v) => v,
+                Err(e) => {
+                    log::error!("{}", e);
+                    return None;
+                }
+            };
+
+            upstream_addr
+        };
+        let upstream_addr = match upstream_addr {
+            Some(v) => v,
+            None => {
+                log::error!("Upstream address is empty");
+                return None;
+            }
+        };
+
         let peer = match self.gen_peer(upstream_addr.clone()).await {
             Ok(peer) => peer,
             Err(e) => {
@@ -93,12 +117,7 @@ impl pingora::apps::ServerApp for TcpProxyApp {
         match client_stream {
             Ok(client_stream) => {
                 if let Err(e) = self
-                    .duplex(
-                        server_stream,
-                        client_stream,
-                        self.buf_size,
-                        upstream_addr.clone(),
-                    )
+                    .duplex(server_stream, client_stream, self.buf_size)
                     .await
                 {
                     log::error!("duplex stream failed: {:?}", e);
@@ -110,15 +129,5 @@ impl pingora::apps::ServerApp for TcpProxyApp {
         }
 
         return None;
-    }
-}
-
-impl Clone for TcpProxyApp {
-    fn clone(&self) -> Self {
-        TcpProxyApp {
-            upstream_addr: self.upstream_addr.clone(),
-            client_connector: TransportConnector::new(None),
-            buf_size: self.buf_size,
-        }
     }
 }
