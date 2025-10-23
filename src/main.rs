@@ -7,7 +7,7 @@ use crate::{
     lua::LuaE,
     proxy::{TcpProxyApp, TcpProxyConfig},
 };
-use std::{fmt::Debug, fs};
+use std::{fmt::Debug, path::Path};
 
 use async_trait::async_trait;
 use clap::Parser;
@@ -40,9 +40,7 @@ fn main() -> anyhow::Result<()> {
     };
     SimpleLogger::new().with_level(log_level).init()?;
 
-    let config_source = fs::read_to_string(args.config)?;
-
-    app(config_source)?;
+    app(args.config)?;
 
     Ok(())
 }
@@ -57,8 +55,10 @@ struct Config {
     etcd_addr: String,
 }
 
-fn app(config_source: String) -> anyhow::Result<()> {
-    let luae = LuaE::init(config_source.clone())?;
+fn app(config_path: String) -> anyhow::Result<()> {
+    let config_path = Path::new(&config_path);
+
+    let luae = LuaE::init(&config_path)?;
     let config = luae.config::<Config>()?;
 
     let mut server = Server::new(None)?;

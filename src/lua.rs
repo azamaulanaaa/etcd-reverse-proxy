@@ -1,4 +1,4 @@
-use std::fmt::Debug;
+use std::{fmt::Debug, fs, path::Path};
 
 use anyhow::Context;
 use mlua::{FromLua, Lua, LuaSerdeExt};
@@ -49,8 +49,16 @@ pub struct LuaE {
 }
 
 impl LuaE {
-    pub fn init(source: String) -> anyhow::Result<Self> {
+    pub fn init(lua_path: &Path) -> anyhow::Result<Self> {
+        let source = fs::read_to_string(lua_path).context("Unable to read lua script")?;
+
         let lua = Lua::new();
+        Self::set_secure_package_path(
+            &lua,
+            lua_path
+                .parent()
+                .context("Unable to locate lua script's directory")?,
+        )?;
 
         log::debug!("Evaluate lua script");
         let lua_main_table: mlua::Table = lua
@@ -62,6 +70,30 @@ impl LuaE {
         let hook = LuaHook::from_lua(lua_main_table.get("hook")?, &lua)?;
 
         Ok(Self { lua, config, hook })
+    }
+
+    fn set_secure_package_path(lua: &Lua, root_dir: &Path) -> anyhow::Result<()> {
+        let abs_root_dir = root_dir
+            .canonicalize()
+            .context("Failed to canonicalize root dir")?;
+
+        let root_path_str = abs_root_dir
+            .to_string_lossy()
+            .strip_prefix(r"\\?\")
+            .context("Path should be valid with prefix removed")?
+            .replace('\\', "/");
+
+        let direct_pattern = format!("{}/?.lua", root_path_str);
+        let init_pattern = format!("{}/?/init.lua", root_path_str);
+
+        let secure_path = format!("{};{}", direct_pattern, init_pattern);
+
+        let update_path_script = format!("package.path = '{}'", secure_path);
+
+        log::debug!("Set Lua package.path to: {}", secure_path);
+        lua.load(&update_path_script).exec()?;
+
+        Ok(())
     }
 
     pub fn config<C>(&self) -> anyhow::Result<C>
